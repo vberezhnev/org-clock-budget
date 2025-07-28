@@ -40,6 +40,12 @@
   :group 'org
   :prefix "org-clock-budget-")
 
+(defcustom org-clock-budget-categories '("CORE" "ASCENT" "CHINESE")
+  "List of categories to include in the clock budget report.
+Clocked time from tasks with these categories will be aggregated in the report."
+  :type '(repeat string)
+  :group 'org-clock-budget)
+
 (defcustom org-clock-budget-intervals
   '(
     ("BUDGET_YEAR" org-clock-budget-interval-this-year)
@@ -168,6 +174,18 @@ etc."
                            last-month
                            (string-to-number (format-time-string "%Y"))))))))
 
+(defun org-clock-budget--get-budget-for-category (category budget)
+  "Find the budget for CATEGORY with BUDGET property.
+Returns the budget in minutes or 0 if not found."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((budget-re (concat ":" budget ":")))
+      (while (re-search-forward budget-re nil t)
+        (when (string= (org-entry-get (point) "CATEGORY") category)
+          (-when-let (current-budget (org-entry-get (point) budget))
+            (return (org-hh:mm-string-to-minutes current-budget)))))
+      0)))
+
 (defun org-clock-budget-interval-this-year ()
   "Return the interval representing this year."
   (cons
@@ -200,43 +218,63 @@ etc."
     hours))
 
 (defun org-clock-budget--get-entries-with-budget (from to budget)
-  "Get all tasks with a budget.
+  "Get all tasks with a budget or matching specified categories, summing clocked time by category.
 
-FROM and TO specify the time range and should be YYYY-MM-DD
-strings.
-
+FROM and TO specify the time range and should be YYYY-MM-DD strings.
 BUDGET is type of the budget property.
 
-CLOCK is a string derived from BUDGET by replacing the string
-\"BUDGET\" with \"CLOCK\".
-
-Return a list (headline CLOCK clocked-time BUDGET budget :marker
-marker-to-headline)"
+Return a list (category CLOCK clocked-time BUDGET budget :marker marker-to-headline)
+for each category with budget or clocked time."
   (save-excursion
     (goto-char (point-min))
     (let ((result nil)
-          (re (concat ":" budget ":")))
-      (while (re-search-forward re nil t)
+          (budget-re (concat ":" budget ":"))
+          (category-re (regexp-opt org-clock-budget-categories))
+          (category-clocked-time (make-hash-table :test 'equal))
+          (category-budget (make-hash-table :test 'equal)))
+      ;; Step 1: Collect clocked time for all tasks with matching categories
+      (while (re-search-forward org-heading-regexp nil t)
+        (let ((category (org-entry-get (point) "CATEGORY")))
+          (when (and category (member category org-clock-budget-categories))
+            (save-excursion
+              (org-back-to-heading t)
+              (let ((clock (org-clock-budget--get-entry-clocked from to)))
+                (when clock
+                  (puthash category
+                           (+ (gethash category category-clocked-time 0) clock)
+                           category-clocked-time)))))))
+      ;; Step 2: Collect budgets from headings with BUDGET_* properties
+      (goto-char (point-min))
+      (while (re-search-forward budget-re nil t)
         (-when-let (current-budget (--when-let (org-entry-get (point) budget)
                                      (org-hh:mm-string-to-minutes it)))
-          (save-excursion
-            (org-back-to-heading t)
-            (let* ((clock (org-clock-budget--get-entry-clocked from to)))
-              (push (list (org-get-heading t t)
-                          (org-clock-budget--get-clock-symbol budget) (or clock 0)
-                          (org-clock-budget--get-budget-symbol budget) current-budget
-                          :marker (point-marker)) result)))))
+          (let ((category (org-entry-get (point) "CATEGORY")))
+            (when (and category (member category org-clock-budget-categories))
+              (puthash category
+                       (+ (gethash category category-budget 0) current-budget)
+                       category-budget)))))
+      ;; Step 3: Create result list, combining clocked time and budgets per category
+      (dolist (category org-clock-budget-categories)
+        (let ((clocked-time (gethash category category-clocked-time 0))
+              (budget-time (gethash category category-budget 0)))
+          (when (or (> clocked-time 0) (> budget-time 0))
+            (push (list category
+                        (org-clock-budget--get-clock-symbol budget) clocked-time
+                        (org-clock-budget--get-budget-symbol budget) budget-time
+                        :marker (point-min-marker)
+                        :category category)
+                  result))))
       (nreverse result))))
 
 (defun org-clock-budget ()
-  "Retrieve headlines with clock budget in current buffer.
+  "Retrieve clock budget and time by category in current buffer.
 
-Each headline with at least one clock budget specified is
-retrieved with clocked time for the specific time range.  It is
-enough for a headline to have one budget specified.
+Clocked time is aggregated for each category in `org-clock-budget-categories'.
+Headings with at least one clock budget specified contribute to the budget,
+and all tasks with matching categories contribute to the clocked time.
 
-You can add or remove intervals by customizing
-`org-clock-budget-intervals'."
+You can add or remove intervals by customizing `org-clock-budget-intervals'
+and categories by customizing `org-clock-budget-categories'."
   (let ((budgets (-mapcat
                   (-lambda ((name int-fn))
                     (-let [(from . to) (funcall int-fn)]
@@ -244,8 +282,8 @@ You can add or remove intervals by customizing
                        from to name)))
                   org-clock-budget-intervals)))
     (-map (lambda (x)
-            (let ((header (car x)))
-              (cons header (apply '-concat (-map 'cdr (cdr x))))))
+            (let ((category (car x)))
+              (cons category (apply '-concat (-map 'cdr (cdr x))))))
           (-group-by 'car budgets))))
 
 (defun org-clock-budget--with-column-header (function)
@@ -344,9 +382,8 @@ Ratio is clock / budget."
   "Produce a clock budget report.
 
 A clock budget report lists for each time range three columns,
-the budget for this range, the already clocked time and a % of
-used-up time.  A headline can have one or multiple budgets set.
-Only headlines with at least one budget are shown."
+the budget for this range, the already clocked time, and a % of
+used-up time. Time is aggregated by categories in `org-clock-budget-categories'."
   (interactive)
   (let ((output (get-buffer-create "*Org clock budget report*"))
         (stats (--mapcat (with-current-buffer (org-get-agenda-file-buffer it)
@@ -358,7 +395,7 @@ Only headlines with at least one budget are shown."
       (erase-buffer)
       (insert (apply
                'format (org-clock-budget-report-row-format)
-               (propertize "Task" :org-clock-budget-report-sort ?a)
+               (propertize "Category" :org-clock-budget-report-sort ?a)
                (--mapcat
                 (let* ((name (cadr (s-match "BUDGET_\\(.*\\)" (car it))))
                        (name-cap (s-capitalize name)))
@@ -370,11 +407,8 @@ Only headlines with at least one budget are shown."
       (insert "|-\n")
       (-each stats
         (lambda (row-data)
-          (-let* (((header &keys :marker marker) row-data)
-                  (row (list (concat
-                              (replace-regexp-in-string
-                               "|" "{pipe}"
-                               (truncate-string-to-width header 40))))))
+          (-let* (((category &keys :marker marker) row-data)
+                  (row (list (truncate-string-to-width category 40))))
             (--each org-clock-budget-intervals
               (-let* ((name (car it))
                       (clock (org-clock-budget--get-clock-symbol name))
