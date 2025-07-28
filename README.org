@@ -1,0 +1,10 @@
+* org-clock-budget
+
+Budget your time with ~org-mode~!
+
+see original package by Fuco1 for more details: [[https://github.com/Fuco1/org-clock-budget]]
+
+** New Functionality
+
+- **Category-Based Time Tracking**: Tracks clocked time for tasks with categories specified in `org-clock-budget-categories` (e.g., CORE, ASCENT, CHINESE), including sub-tasks under headings like "Actions," even if they lack `BUDGET_*` properties.
+- **Aggregated Reporting by Category**: The report aggregates clocked time and budgets by category, displaying total clocked time and budget for each category (e.g., CORE, ASCENT, CHINESE) across all relevant tasks.
